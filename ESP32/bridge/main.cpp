@@ -1,49 +1,115 @@
-/*
- *  This sketch demonstrates how to scan WiFi networks.
- *  The API is almost the same as with the WiFi Shield library,
- *  the most obvious difference being the different file you need to include:
- */
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_now.h>
 
-void setup()
-{
-    Serial.begin(115200);
+struct CommandPayload {
+    int vx;
+    int vy;
+    int dtheta;
+} __attribute__((packed));
 
-    // Set WiFi to station mode and disconnect from an AP if it was previously connected
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+struct HeartbeatPayload {
+    uint8_t robot_id;
+} __attribute__((packed));
 
-    Serial.println("Setup done");
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+#define SERIAL_CMD_HEADER_1 0xAA
+#define SERIAL_CMD_HEADER_2 0xBB
+#define SERIAL_HB_HEADER_1 0xCC
+#define SERIAL_HB_HEADER_2 0xDD
+
+enum SerialReadState {
+    WAIT_HEADER_1,
+    WAIT_HEADER_2,
+    WAIT_LEN,
+    WAIT_DATA
+};
+SerialReadState serialState = WAIT_HEADER_1;
+uint8_t payloadLen;
+uint8_t serialBuffer[250];
+int serialBufferIdx = 0;
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+    if(len == sizeof(HeartbeatPayload)){
+        Serial.write(SERIAL_HB_HEADER_1);
+        Serial.write(SERIAL_HB_HEADER_2);
+        Serial.write((uint8_t)len);
+        Serial.write(incomingData, len);
+    }
 }
 
-void loop()
-{
-    Serial.println("scan start");
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("Last Packet Send Status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
 
-    // WiFi.scanNetworks will return the number of networks found
-    int n = WiFi.scanNetworks();
-    Serial.println("scan done");
-    if (n == 0) {
-        Serial.println("no networks found");
-    } else {
-        Serial.print(n);
-        Serial.println(" networks found");
-        for (int i = 0; i < n; ++i) {
-            // Print SSID and RSSI for each network found
-            Serial.print(i + 1);
-            Serial.print(": ");
-            Serial.print(WiFi.SSID(i));
-            Serial.print(" (");
-            Serial.print(WiFi.RSSI(i));
-            Serial.print(")");
-            Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN)?" ":"*");
-            delay(10);
+void checkSerial() {
+    while (Serial.available() > 0) {
+        uint8_t b = Serial.read();
+        switch (serialState) {
+            case WAIT_HEADER_1:
+                if (b == SERIAL_CMD_HEADER_1) {
+                    serialState = WAIT_HEADER_2;
+                }
+                break;
+
+            case WAIT_HEADER_2:
+                if (b == SERIAL_CMD_HEADER_2) {
+                    serialState = WAIT_LEN;
+                } else {
+                    serialState = WAIT_HEADER_1;
+                }
+                break;
+
+            case WAIT_LEN:
+                payloadLen = b;
+                serialBufferIdx = 0;
+                if (payloadLen > 0 && payloadLen <= 250) {
+                    serialState = WAIT_DATA;
+                } else {
+                    serialState = WAIT_HEADER_1;
+                }
+                break;
+
+            case WAIT_DATA:
+                serialBuffer[serialBufferIdx++] = b;
+                if (serialBufferIdx == payloadLen) {
+                    esp_now_send(broadcastAddress, serialBuffer, payloadLen);
+                    serialState = WAIT_HEADER_1;
+                }
+                break;
         }
     }
-    Serial.println("");
+}
 
-    // Wait a bit before scanning again
-    delay(5000);
+void setup() {
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    Serial.println("ESP-NOW Bridge");
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.println("--------------------");
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.ifidx = WIFI_IF_STA;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK){
+        Serial.println("Failed to add broadcast peer");
+        return;
+    }
+    Serial.println("Bridge setup complete. Listening for Serial and ESP-NOW...");
+}
+
+void loop() {
+    checkSerial();
 }
